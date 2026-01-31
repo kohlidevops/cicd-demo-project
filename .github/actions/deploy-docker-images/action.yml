@@ -1,0 +1,123 @@
+name: 'Deploy Docker Images'
+description: 'Deploy Docker images to specified environment'
+inputs:
+  environment:
+    description: 'Target environment (acceptance, qa, production)'
+    required: true
+  version:
+    description: 'Version tag to deploy'
+    required: true
+  image-urls:
+    description: 'JSON array of image URLs with digests or tags'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Parse Image URLs
+      id: parse
+      shell: bash
+      run: |
+        echo "Parsing image URLs for deployment"
+        IMAGE_URL=$(echo '${{ inputs.image-urls }}' | jq -r '.[0]')
+        echo "image-url=$IMAGE_URL" >> $GITHUB_OUTPUT
+        echo "Deploying: $IMAGE_URL"
+
+    - name: Set Environment Variables
+      id: set-env
+      shell: bash
+      run: |
+        case "${{ inputs.environment }}" in
+          acceptance)
+            echo "ssh-host=${{ secrets.AWS_ACCEPTANCE_HOST }}" >> $GITHUB_OUTPUT
+            echo "ssh-user=${{ secrets.AWS_ACCEPTANCE_USER }}" >> $GITHUB_OUTPUT
+            echo "ssh-key<<EOF" >> $GITHUB_OUTPUT
+            echo "${{ secrets.AWS_ACCEPTANCE_KEY }}" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            ;;
+          qa)
+            echo "ssh-host=${{ secrets.AWS_QA_HOST }}" >> $GITHUB_OUTPUT
+            echo "ssh-user=${{ secrets.AWS_QA_USER }}" >> $GITHUB_OUTPUT
+            echo "ssh-key<<EOF" >> $GITHUB_OUTPUT
+            echo "${{ secrets.AWS_QA_KEY }}" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            ;;
+          production)
+            echo "ssh-host=${{ secrets.AWS_PRODUCTION_HOST }}" >> $GITHUB_OUTPUT
+            echo "ssh-user=${{ secrets.AWS_PRODUCTION_USER }}" >> $GITHUB_OUTPUT
+            echo "ssh-key<<EOF" >> $GITHUB_OUTPUT
+            echo "${{ secrets.AWS_PRODUCTION_KEY }}" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+            ;;
+        esac
+
+    - name: Deploy to Server
+      shell: bash
+      env:
+        SSH_HOST: ${{ steps.set-env.outputs.ssh-host }}
+        SSH_USER: ${{ steps.set-env.outputs.ssh-user }}
+        SSH_KEY: ${{ steps.set-env.outputs.ssh-key }}
+        IMAGE_URL: ${{ steps.parse.outputs.image-url }}
+        VERSION: ${{ inputs.version }}
+        ENVIRONMENT: ${{ inputs.environment }}
+      run: |
+        # Create SSH key file
+        mkdir -p ~/.ssh
+        echo "$SSH_KEY" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        
+        # Add host to known_hosts
+        ssh-keyscan -H $SSH_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+        
+        # Create deployment script
+        cat > deploy.sh << 'DEPLOY_SCRIPT'
+        #!/bin/bash
+        set -e
+        
+        echo "🚀 Starting deployment to $ENVIRONMENT"
+        echo "📦 Image: $IMAGE_URL"
+        echo "🏷️  Version: $VERSION"
+        
+        # Login to GHCR
+        echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+        
+        # Pull new image
+        docker pull $IMAGE_URL
+        
+        # Stop existing container
+        docker stop monolith-app || true
+        docker rm monolith-app || true
+        
+        # Run new container
+        docker run -d \
+          --name monolith-app \
+          --restart unless-stopped \
+          -p 3000:3000 \
+          -e NODE_ENV=production \
+          -e APP_VERSION=$VERSION \
+          $IMAGE_URL
+        
+        # Wait for health check
+        sleep 5
+        
+        # Verify deployment
+        if curl -f http://localhost:3000/health; then
+          echo "✅ Deployment successful!"
+        else
+          echo "❌ Deployment failed - health check failed"
+          exit 1
+        fi
+        
+        # Cleanup old images
+        docker image prune -af --filter "until=24h"
+        
+        echo "🎉 Deployment complete!"
+        DEPLOY_SCRIPT
+        
+        # Copy and execute deployment script
+        scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no deploy.sh $SSH_USER@$SSH_HOST:/tmp/
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST \
+          "IMAGE_URL=$IMAGE_URL VERSION=$VERSION ENVIRONMENT=$ENVIRONMENT bash /tmp/deploy.sh"
+        
+        # Cleanup
+        rm -f ~/.ssh/deploy_key deploy.sh

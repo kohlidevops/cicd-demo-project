@@ -1,0 +1,120 @@
+name: qa-stage
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Prerelease version to deploy (e.g., v1.0.4-rc)'
+        required: true
+        type: string
+
+concurrency:
+  group: qa-stage
+  cancel-in-progress: true
+
+jobs:
+  check-release-exists:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check Version Release Exists
+        id: check-release
+        uses: optivem/check-release-exists-action@v1
+        with:
+          version: ${{ inputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  resolve-docker-images:
+    needs: check-release-exists
+    if: needs.check-release-exists.result == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      image-urls: ${{ steps.resolve-images.outputs.image-urls }}
+    steps:
+      - name: Resolve Docker Images
+        id: resolve-images
+        uses: optivem/resolve-docker-images-action@v1
+        with:
+          tag: ${{ inputs.version }}
+          base-image-urls: |
+            ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}/monolith
+
+  deployment:
+    needs: [check-release-exists, resolve-docker-images]
+    if: needs.resolve-docker-images.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Deploy System
+        id: deploy
+        uses: ./.github/actions/deploy-docker-images
+        with:
+          environment: qa
+          version: ${{ inputs.version }}
+          image-urls: ${{ needs.resolve-docker-images.outputs.image-urls }}
+
+  status-version:
+    needs: [deployment]
+    if: needs.deployment.result == 'success' # Only on successful deployment
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.determine-version.outputs.version }}
+      status: deployed
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Generate Status Version
+        id: determine-version
+        uses: optivem/generate-status-version-action@v1
+        with:
+          version: ${{ inputs.version }}
+          environment: qa
+          status: deployed
+
+  deployment-release:
+    needs: [resolve-docker-images, status-version]
+    if: needs.status-version.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      release-url: ${{ steps.create-release.outputs.release-url }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Create Deployment Release
+        id: create-release
+        uses: optivem/create-release-action@v1
+        with:
+          base-version: ${{ inputs.version }}
+          release-version: ${{ needs.status-version.outputs.version }}
+          environment: qa
+          status: ${{ needs.status-version.outputs.status }}
+          artifact-urls: ${{ (needs.resolve-docker-images.result == 'success' && needs.resolve-docker-images.outputs.image-urls) || '[]' }}
+          is-prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  summary:
+    needs: [check-release-exists, resolve-docker-images, deployment, status-version, deployment-release]
+    if: always() # Run even if previous jobs fail
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      
+    - name: Generate QA Deployment Stage Summary
+      uses: optivem/summarize-system-stage-action@v1
+      with:
+        stage-name: 'QA Stage'
+        environment: qa
+        stage-result: ${{ needs.deployment-release.result }}
+        success-version: ${{ needs.status-version.outputs.version }}
+        success-artifact-ids: ${{ needs.resolve-docker-images.outputs.image-urls }}
