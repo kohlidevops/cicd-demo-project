@@ -602,6 +602,7 @@ cat ~/Downloads/cicd-demo-key.pem
 ```yaml
 name: 'Deploy Docker Images'
 description: 'Deploy Docker images to specified environment'
+
 inputs:
   environment:
     description: 'Target environment (acceptance, qa, production)'
@@ -612,140 +613,208 @@ inputs:
   image-urls:
     description: 'JSON array of image URLs with digests or tags'
     required: true
+  ssh-host:
+    description: 'SSH host to deploy to'
+    required: true
+  ssh-user:
+    description: 'SSH user'
+    required: true
+  ssh-key:
+    description: 'SSH private key'
+    required: true
+  github-token:
+    description: 'GitHub token for GHCR authentication'
+    required: true
 
 runs:
   using: "composite"
   steps:
-    - name: Parse Image URLs
+    - name: Debug Input
+      shell: bash
+      run: |
+        echo "=== DEBUG INFO ==="
+        echo "Raw image-urls input: ${{ inputs.image-urls }}"
+        echo "Environment: ${{ inputs.environment }}"
+        echo "Version: ${{ inputs.version }}"
+        echo "=================="
+
+    - name: Parse Image URL
       id: parse
       shell: bash
       run: |
-        echo "Parsing image URLs for deployment"
-        IMAGE_URL=$(echo '${{ inputs.image-urls }}' | jq -r '.[0]')
+        set -e
+        RAW_INPUT='${{ inputs.image-urls }}'
+        echo "Raw input: $RAW_INPUT"
+        
+        # Remove brackets and quotes if it's a JSON array
+        IMAGE_URL=$(echo "$RAW_INPUT" | sed 's/^\["//' | sed 's/"\]$//' | sed 's/^"//' | sed 's/"$//')
+        
+        echo "Parsed IMAGE_URL: $IMAGE_URL"
+        
+        if [ -z "$IMAGE_URL" ] || [ "$IMAGE_URL" = "null" ]; then
+          echo "❌ Failed to parse image URL"
+          exit 1
+        fi
+        
         echo "image-url=$IMAGE_URL" >> $GITHUB_OUTPUT
-        echo "Deploying: $IMAGE_URL"
+        echo "✅ Successfully parsed image URL"
 
-    - name: Set Environment Variables
-      id: set-env
+    - name: Create Deployment Script
       shell: bash
       run: |
-        case "${{ inputs.environment }}" in
-          acceptance)
-            echo "ssh-host=${{ secrets.AWS_ACCEPTANCE_HOST }}" >> $GITHUB_OUTPUT
-            echo "ssh-user=${{ secrets.AWS_ACCEPTANCE_USER }}" >> $GITHUB_OUTPUT
-            echo "ssh-key<<EOF" >> $GITHUB_OUTPUT
-            echo "${{ secrets.AWS_ACCEPTANCE_KEY }}" >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
-            ;;
-          qa)
-            echo "ssh-host=${{ secrets.AWS_QA_HOST }}" >> $GITHUB_OUTPUT
-            echo "ssh-user=${{ secrets.AWS_QA_USER }}" >> $GITHUB_OUTPUT
-            echo "ssh-key<<EOF" >> $GITHUB_OUTPUT
-            echo "${{ secrets.AWS_QA_KEY }}" >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
-            ;;
-          production)
-            echo "ssh-host=${{ secrets.AWS_PRODUCTION_HOST }}" >> $GITHUB_OUTPUT
-            echo "ssh-user=${{ secrets.AWS_PRODUCTION_USER }}" >> $GITHUB_OUTPUT
-            echo "ssh-key<<EOF" >> $GITHUB_OUTPUT
-            echo "${{ secrets.AWS_PRODUCTION_KEY }}" >> $GITHUB_OUTPUT
-            echo "EOF" >> $GITHUB_OUTPUT
-            ;;
-        esac
-
-    - name: Deploy to Server
-      shell: bash
-      env:
-        SSH_HOST: ${{ steps.set-env.outputs.ssh-host }}
-        SSH_USER: ${{ steps.set-env.outputs.ssh-user }}
-        SSH_KEY: ${{ steps.set-env.outputs.ssh-key }}
-        IMAGE_URL: ${{ steps.parse.outputs.image-url }}
-        VERSION: ${{ inputs.version }}
-        ENVIRONMENT: ${{ inputs.environment }}
-      run: |
-        # Create SSH key file
-        mkdir -p ~/.ssh
-        echo "$SSH_KEY" > ~/.ssh/deploy_key
-        chmod 600 ~/.ssh/deploy_key
-        
-        # Add host to known_hosts
-        ssh-keyscan -H $SSH_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
-        
-        # Create deployment script
-        cat > deploy.sh << 'DEPLOY_SCRIPT'
+        cat > /tmp/deploy.sh << 'SCRIPT_END'
         #!/bin/bash
         set -e
         
-        echo "🚀 Starting deployment to $ENVIRONMENT"
-        echo "📦 Image: $IMAGE_URL"
-        echo "🏷️  Version: $VERSION"
+        echo "=== Deployment Starting ==="
+        echo "Environment: $ENVIRONMENT"
+        echo "Image URL: $IMAGE_URL"
+        echo "Version: $VERSION"
+        echo "=========================="
+        
+        # Validate inputs
+        if [ -z "$IMAGE_URL" ]; then
+          echo "❌ IMAGE_URL is empty"
+          exit 1
+        fi
         
         # Login to GHCR
-        echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+        echo "🔐 Logging into GHCR..."
+        echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin 2>&1 | grep -v "WARNING" || true
         
         # Pull new image
-        docker pull $IMAGE_URL
+        echo "⬇️  Pulling image: $IMAGE_URL"
+        docker pull "$IMAGE_URL"
         
         # Stop existing container
-        docker stop monolith-app || true
-        docker rm monolith-app || true
+        echo "🛑 Stopping existing container..."
+        docker stop monolith-app 2>/dev/null || true
+        docker rm monolith-app 2>/dev/null || true
         
         # Run new container
+        echo "▶️  Starting new container..."
         docker run -d \
           --name monolith-app \
           --restart unless-stopped \
           -p 3000:3000 \
           -e NODE_ENV=production \
-          -e APP_VERSION=$VERSION \
-          $IMAGE_URL
+          -e APP_VERSION="$VERSION" \
+          "$IMAGE_URL"
         
-        # Wait for health check
-        sleep 5
+        # Wait for application to start
+        echo "⏳ Waiting for application to start..."
+        sleep 10
         
-        # Verify deployment
-        if curl -f http://localhost:3000/health; then
-          echo "✅ Deployment successful!"
-        else
-          echo "❌ Deployment failed - health check failed"
+        # Verify deployment with health check
+        echo "🏥 Running health check..."
+        MAX_ATTEMPTS=30
+        ATTEMPT=0
+        
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          if curl -f http://localhost:3000/health 2>/dev/null; then
+            echo "✅ Health check passed!"
+            echo "✅ Deployment successful!"
+            
+            echo ""
+            echo "📊 Container status:"
+            docker ps --filter name=monolith-app
+            
+            echo ""
+            echo "🧹 Cleaning up old images..."
+            docker image prune -af --filter "until=24h" 2>/dev/null || true
+            
+            echo ""
+            echo "🎉 Deployment complete!"
+            exit 0
+          fi
+          
+          ATTEMPT=$((ATTEMPT + 1))
+          echo "⏳ Waiting for health check... attempt $ATTEMPT/$MAX_ATTEMPTS"
+          sleep 2
+        done
+        
+        echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
+        echo "📋 Container logs:"
+        docker logs monolith-app || true
+        exit 1
+        SCRIPT_END
+        
+        chmod +x /tmp/deploy.sh
+
+    - name: Deploy to Server
+      shell: bash
+      run: |
+        set -e
+        
+        SSH_HOST="${{ inputs.ssh-host }}"
+        SSH_USER="${{ inputs.ssh-user }}"
+        IMAGE_URL="${{ steps.parse.outputs.image-url }}"
+        VERSION="${{ inputs.version }}"
+        ENVIRONMENT="${{ inputs.environment }}"
+        
+        echo "🚀 Deploying to $ENVIRONMENT environment"
+        echo "📦 Host: $SSH_HOST"
+        echo "👤 User: $SSH_USER"
+        echo "🐳 Image: $IMAGE_URL"
+        echo "🏷️  Version: $VERSION"
+        
+        # Validate IMAGE_URL again
+        if [ -z "$IMAGE_URL" ] || [ "$IMAGE_URL" = "null" ]; then
+          echo "❌ Error: IMAGE_URL is empty or null after parsing"
+          echo "Original input was: ${{ inputs.image-urls }}"
           exit 1
         fi
         
-        # Cleanup old images
-        docker image prune -af --filter "until=24h"
+        # Create SSH key file
+        mkdir -p ~/.ssh
+        echo "${{ inputs.ssh-key }}" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
         
-        echo "🎉 Deployment complete!"
-        DEPLOY_SCRIPT
+        # Add host to known_hosts
+        ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
         
-        # Copy and execute deployment script
-        scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no deploy.sh $SSH_USER@$SSH_HOST:/tmp/
-        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no $SSH_USER@$SSH_HOST \
-          "IMAGE_URL=$IMAGE_URL VERSION=$VERSION ENVIRONMENT=$ENVIRONMENT bash /tmp/deploy.sh"
+        # Copy deployment script to server
+        echo "📤 Copying deployment script to server..."
+        scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no /tmp/deploy.sh ${SSH_USER}@${SSH_HOST}:/tmp/deploy.sh
+        
+        # Execute deployment on server
+        echo "🚀 Executing deployment on server..."
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_HOST} << EOF
+        export ENVIRONMENT="$ENVIRONMENT"
+        export IMAGE_URL="$IMAGE_URL"
+        export VERSION="$VERSION"
+        export GITHUB_TOKEN="${{ inputs.github-token }}"
+        export GITHUB_ACTOR="${{ github.actor }}"
+        bash /tmp/deploy.sh
+        EOF
         
         # Cleanup
-        rm -f ~/.ssh/deploy_key deploy.sh
+        rm -f ~/.ssh/deploy_key /tmp/deploy.sh
+        
+        echo "✅ Deployment to $ENVIRONMENT completed successfully!"
 ```
 
 ### Step 5.2: Create Workflow Files
 
 #### File: `.github/workflows/commit-stage-monolith.yml`
 
-(Use the exact content you provided earlier - I'll include it in the final file structure)
+https://github.com/kohlidevops/cicd-demo-project/blob/main/.github/workflows/commit-stage-monolith.yml
 
 #### File: `.github/workflows/acceptance-stage.yml`
 
-(Use the exact content you provided earlier)
+https://github.com/kohlidevops/cicd-demo-project/blob/main/.github/workflows/acceptance-stage.yml
 
 #### File: `.github/workflows/qa-stage.yml`
 
-(Use the exact content you provided earlier)
+https://github.com/kohlidevops/cicd-demo-project/blob/main/.github/workflows/qa-stage.yml
 
 #### File: `.github/workflows/qa-signoff.yml`
 
-(Use the exact content you provided earlier)
+https://github.com/kohlidevops/cicd-demo-project/blob/main/.github/workflows/qa-signoff.yml
 
 #### File: `.github/workflows/prod-stage.yml`
 
-(Use the exact content you provided earlier)
+https://github.com/kohlidevops/cicd-demo-project/blob/main/.github/workflows/prod-stage.yml
 
 ### Step 5.3: Create Mock Action Files
 
@@ -1006,35 +1075,6 @@ docker restart monolith-app
 
 ---
 
-## Next Steps
-
-### Enhancements
-
-1. **Add monitoring**: Integrate Prometheus/Grafana
-2. **Add logging**: Use ELK stack or CloudWatch
-3. **Add database**: PostgreSQL or MongoDB
-4. **Add caching**: Redis
-5. **Add load balancer**: AWS ALB or Nginx
-6. **Add SSL/TLS**: Let's Encrypt certificates
-7. **Add backup**: Automated database backups
-8. **Add notifications**: Slack/Discord integration
-9. **Add security scanning**: Snyk, Trivy
-10. **Add performance tests**: k6, Artillery
-
-### Production Readiness Checklist
-
-- [ ] Environment variables management (AWS Secrets Manager)
-- [ ] Database migrations automation
-- [ ] Rollback procedures
-- [ ] Disaster recovery plan
-- [ ] Load testing completed
-- [ ] Security audit completed
-- [ ] Documentation updated
-- [ ] Team training completed
-- [ ] Monitoring alerts configured
-- [ ] On-call rotation established
-
----
 
 ## Resources
 
