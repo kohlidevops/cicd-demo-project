@@ -27,14 +27,35 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Parse Image URLs
+    - name: Debug Input
+      shell: bash
+      run: |
+        echo "=== DEBUG INFO ==="
+        echo "Raw image-urls input: ${{ inputs.image-urls }}"
+        echo "Environment: ${{ inputs.environment }}"
+        echo "Version: ${{ inputs.version }}"
+        echo "=================="
+
+    - name: Parse Image URL
       id: parse
       shell: bash
       run: |
-        echo "Parsing image URLs for deployment"
-        IMAGE_URL=$(echo '${{ inputs.image-urls }}' | jq -r '.[0]')
+        set -e
+        RAW_INPUT='${{ inputs.image-urls }}'
+        echo "Raw input: $RAW_INPUT"
+        
+        # Remove brackets and quotes if it's a JSON array
+        IMAGE_URL=$(echo "$RAW_INPUT" | sed 's/^\["//' | sed 's/"\]$//' | sed 's/^"//' | sed 's/"$//')
+        
+        echo "Parsed IMAGE_URL: $IMAGE_URL"
+        
+        if [ -z "$IMAGE_URL" ] || [ "$IMAGE_URL" = "null" ]; then
+          echo "❌ Failed to parse image URL"
+          exit 1
+        fi
+        
         echo "image-url=$IMAGE_URL" >> $GITHUB_OUTPUT
-        echo "Deploying: $IMAGE_URL"
+        echo "✅ Successfully parsed image URL"
 
     - name: Create Deployment Script
       shell: bash
@@ -43,15 +64,24 @@ runs:
         #!/bin/bash
         set -e
         
-        echo "🚀 Starting deployment to $ENVIRONMENT"
-        echo "📦 Image: $IMAGE_URL"
-        echo "🏷️  Version: $VERSION"
+        echo "=== Deployment Starting ==="
+        echo "Environment: $ENVIRONMENT"
+        echo "Image URL: $IMAGE_URL"
+        echo "Version: $VERSION"
+        echo "=========================="
+        
+        # Validate inputs
+        if [ -z "$IMAGE_URL" ]; then
+          echo "❌ IMAGE_URL is empty"
+          exit 1
+        fi
         
         # Login to GHCR
-        echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin 2>&1 | grep -v "WARNING"
+        echo "🔐 Logging into GHCR..."
+        echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin 2>&1 | grep -v "WARNING" || true
         
         # Pull new image
-        echo "⬇️  Pulling image..."
+        echo "⬇️  Pulling image: $IMAGE_URL"
         docker pull "$IMAGE_URL"
         
         # Stop existing container
@@ -83,12 +113,10 @@ runs:
             echo "✅ Health check passed!"
             echo "✅ Deployment successful!"
             
-            # Show container status
             echo ""
             echo "📊 Container status:"
             docker ps --filter name=monolith-app
             
-            # Cleanup old images
             echo ""
             echo "🧹 Cleaning up old images..."
             docker image prune -af --filter "until=24h" 2>/dev/null || true
@@ -113,17 +141,14 @@ runs:
 
     - name: Deploy to Server
       shell: bash
-      env:
-        SSH_HOST: ${{ inputs.ssh-host }}
-        SSH_USER: ${{ inputs.ssh-user }}
-        SSH_KEY: ${{ inputs.ssh-key }}
-        IMAGE_URL: ${{ steps.parse.outputs.image-url }}
-        VERSION: ${{ inputs.version }}
-        ENVIRONMENT: ${{ inputs.environment }}
-        GITHUB_TOKEN: ${{ inputs.github-token }}
-        GITHUB_ACTOR: ${{ github.actor }}
       run: |
         set -e
+        
+        SSH_HOST="${{ inputs.ssh-host }}"
+        SSH_USER="${{ inputs.ssh-user }}"
+        IMAGE_URL="${{ steps.parse.outputs.image-url }}"
+        VERSION="${{ inputs.version }}"
+        ENVIRONMENT="${{ inputs.environment }}"
         
         echo "🚀 Deploying to $ENVIRONMENT environment"
         echo "📦 Host: $SSH_HOST"
@@ -131,28 +156,35 @@ runs:
         echo "🐳 Image: $IMAGE_URL"
         echo "🏷️  Version: $VERSION"
         
-        # Validate IMAGE_URL
+        # Validate IMAGE_URL again
         if [ -z "$IMAGE_URL" ] || [ "$IMAGE_URL" = "null" ]; then
-          echo "❌ Error: IMAGE_URL is empty or null"
+          echo "❌ Error: IMAGE_URL is empty or null after parsing"
+          echo "Original input was: ${{ inputs.image-urls }}"
           exit 1
         fi
         
         # Create SSH key file
         mkdir -p ~/.ssh
-        echo "$SSH_KEY" > ~/.ssh/deploy_key
+        echo "${{ inputs.ssh-key }}" > ~/.ssh/deploy_key
         chmod 600 ~/.ssh/deploy_key
         
         # Add host to known_hosts
-        ssh-keyscan -H $SSH_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
+        ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
         
         # Copy deployment script to server
         echo "📤 Copying deployment script to server..."
         scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no /tmp/deploy.sh ${SSH_USER}@${SSH_HOST}:/tmp/deploy.sh
         
-        # Execute deployment script on server with environment variables
+        # Execute deployment on server
         echo "🚀 Executing deployment on server..."
-        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_HOST} \
-          bash -c "export ENVIRONMENT='$ENVIRONMENT' IMAGE_URL='$IMAGE_URL' VERSION='$VERSION' GITHUB_TOKEN='$GITHUB_TOKEN' GITHUB_ACTOR='$GITHUB_ACTOR' && bash /tmp/deploy.sh"
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_HOST} << EOF
+        export ENVIRONMENT="$ENVIRONMENT"
+        export IMAGE_URL="$IMAGE_URL"
+        export VERSION="$VERSION"
+        export GITHUB_TOKEN="${{ inputs.github-token }}"
+        export GITHUB_ACTOR="${{ github.actor }}"
+        bash /tmp/deploy.sh
+        EOF
         
         # Cleanup
         rm -f ~/.ssh/deploy_key /tmp/deploy.sh

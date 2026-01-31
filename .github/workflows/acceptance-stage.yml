@@ -78,7 +78,7 @@ jobs:
       with:
         environment: acceptance
         version: latest
-        image-urls: '["${{ needs.find-latest-images.outputs.image-digest-url }}"]'
+        image-urls: ${{ needs.find-latest-images.outputs.image-digest-url }}
         ssh-host: ${{ secrets.AWS_ACCEPTANCE_HOST }}
         ssh-user: ${{ secrets.AWS_ACCEPTANCE_USER }}
         ssh-key: ${{ secrets.AWS_ACCEPTANCE_KEY }}
