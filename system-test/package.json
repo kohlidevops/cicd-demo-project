@@ -1,0 +1,12 @@
+{
+  "name": "system-test",
+  "version": "1.0.0",
+  "description": "End-to-end system tests",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.40.1",
+    "@types/node": "^20.10.0"
+  }
+}
