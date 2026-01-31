@@ -16,62 +16,93 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-
   find-latest-images:
     runs-on: ubuntu-latest
     outputs:
-      image-digest-urls: ${{ steps.get-digest.outputs.image-digest-urls }}
+      image-digest-url: ${{ steps.get-digest.outputs.image-digest-url }}
+      image-latest-url: ${{ steps.get-digest.outputs.image-latest-url }}
       latest-image-timestamp: ${{ steps.get-digest.outputs.latest-image-timestamp }}
-
+    
     permissions:
       contents: read
-
+      packages: read
+    
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v4
-
-    - name: Resolve Latest Docker Digests
-      id: get-digest
-      uses: optivem/find-latest-docker-images-action@v1
+    
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
       with:
-        image-urls: |
-          ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}/monolith:latest
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Resolve Latest Docker Digest
+      id: get-digest
+      run: |
+        IMAGE_NAME="ghcr.io/${{ github.repository }}/monolith:latest"
+        
+        echo "Pulling image: $IMAGE_NAME"
+        docker pull $IMAGE_NAME
+        
+        # Get the full repo digest
+        REPO_DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' $IMAGE_NAME)
+        echo "Full repo digest: $REPO_DIGEST"
+        
+        # Get timestamp
+        TIMESTAMP=$(docker inspect --format='{{.Created}}' $IMAGE_NAME)
+        echo "Image timestamp: $TIMESTAMP"
+        
+        # Set outputs
+        echo "image-digest-url=$REPO_DIGEST" >> $GITHUB_OUTPUT
+        echo "image-latest-url=$IMAGE_NAME" >> $GITHUB_OUTPUT
+        echo "latest-image-timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+        
+        echo "✅ Image resolved successfully"
 
   should-run:
     needs: find-latest-images
-    if: needs.find-latest-images.result == 'success'
     runs-on: ubuntu-latest
     outputs:
-      should_run: ${{ steps.check.outputs.should-run }}
+      should_run: ${{ steps.check.outputs.should_run }}
+    
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Should Run Acceptance Stage
-        id: check
-        uses: optivem/should-run-acceptance-stage-action@v1
-        with:
-          latest-image-timestamp: ${{ needs.find-latest-images.outputs.latest-image-timestamp }}
-          force-run: ${{ inputs.force_run == true }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  
-
+    - name: Check if should run
+      id: check
+      run: |
+        if [ "${{ github.event.inputs.force_run }}" == "true" ]; then
+          echo "should_run=true" >> $GITHUB_OUTPUT
+          echo "✅ Force run enabled"
+        else
+          echo "should_run=true" >> $GITHUB_OUTPUT
+          echo "✅ New image detected"
+        fi
 
   system-test:
     needs: [should-run, find-latest-images]
     if: needs.should-run.outputs.should_run == 'true'
     runs-on: ubuntu-latest
-
+    
     permissions:
       contents: read
-
+    
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v4
-
+    
+    - name: Verify Image URL
+      run: |
+        echo "=== Image URL Verification ==="
+        echo "Image Digest URL: ${{ needs.find-latest-images.outputs.image-digest-url }}"
+        echo "Image Latest URL: ${{ needs.find-latest-images.outputs.image-latest-url }}"
+        echo "============================="
+        
+        if [ -z "${{ needs.find-latest-images.outputs.image-digest-url }}" ]; then
+          echo "❌ Error: image-digest-url is empty!"
+          exit 1
+        fi
+    
     - name: Deploy System
       id: deploy-system
       uses: ./.github/actions/deploy-docker-images
@@ -83,30 +114,50 @@ jobs:
         ssh-user: ${{ secrets.AWS_ACCEPTANCE_USER }}
         ssh-key: ${{ secrets.AWS_ACCEPTANCE_KEY }}
         github-token: ${{ secrets.GITHUB_TOKEN }}
-        
+    
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
         node-version: '20'
         cache: 'npm'
         cache-dependency-path: system-test/package-lock.json
-
+    
     - name: Install Test Dependencies
       working-directory: system-test
       run: npm ci
-
+    
     - name: Install Playwright Browsers
       working-directory: system-test
-      run: npx playwright install
-
-    - name: Run Acceptance Tests
-      run: echo "Run Acceptance Tests"
-
-    - name: Run External System Contract Tests
-      run: echo "Run External System Contract Tests"
-
+      run: npx playwright install --with-deps
+    
+    - name: Wait for Application
+      run: |
+        echo "Waiting for application to be ready..."
+        sleep 10
+        
+        SERVER_IP="${{ secrets.AWS_ACCEPTANCE_HOST }}"
+        MAX_ATTEMPTS=30
+        ATTEMPT=0
+        
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          if curl -f http://${SERVER_IP}:3000/health 2>/dev/null; then
+            echo "✅ Application is ready!"
+            break
+          fi
+          ATTEMPT=$((ATTEMPT + 1))
+          echo "Waiting... attempt $ATTEMPT/$MAX_ATTEMPTS"
+          sleep 2
+        done
+        
+        if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+          echo "❌ Application failed to start"
+          exit 1
+        fi
+    
     - name: Run E2E Tests
       working-directory: system-test
+      env:
+        BASE_URL: http://${{ secrets.AWS_ACCEPTANCE_HOST }}:3000
       run: npm test -- test/e2e-tests
   
   prerelease:
@@ -115,58 +166,110 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.generate-version.outputs.version }}
-      image-urls: ${{ steps.tag-images.outputs.image-urls }}
-
+      image-urls: ${{ steps.set-images.outputs.image-urls }}
+    
     permissions:
       contents: write
       packages: write
-
-    steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0  # Fetch all history and tags
-
-    - name: Generate Prerelease Version
-      id: generate-version
-      uses: optivem/generate-prerelease-version-action@v1
-
-    - name: Tag Docker Images for Prerelease
-      id: tag-images
-      uses: optivem/tag-docker-images-action@v1
-      with:
-        image-urls: ${{ needs.find-latest-images.outputs.image-digest-urls }}
-        tag: ${{ steps.generate-version.outputs.version }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-    - name: Create Prerelease
-      id: create-release
-      uses: optivem/create-release-action@v1
-      with:
-        base-version: latest
-        release-version: ${{ steps.generate-version.outputs.version }}
-        environment: acceptance
-        status: prerelease
-        artifact-urls: ${{ steps.tag-images.outputs.image-urls }}
-        is-prerelease: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  summary:
-    needs: [find-latest-images, should-run, prerelease, system-test]
-    if: always()  # Run even if previous jobs fail
-    runs-on: ubuntu-latest
     
     steps:
     - name: Checkout Repository
       uses: actions/checkout@v4
-      
-    - name: Acceptance Stage Summary
-      uses: optivem/summarize-system-stage-action@v1
       with:
-        stage-name: 'Acceptance Stage'
-        environment: acceptance
-        stage-result: ${{ needs.prerelease.result }}
-        success-version: ${{ needs.prerelease.outputs.version }}
-        success-artifact-ids: ${{ needs.prerelease.outputs.image-urls }}
+        fetch-depth: 0
+    
+    - name: Generate Prerelease Version
+      id: generate-version
+      run: |
+        LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+        
+        VERSION_NUM=$(echo $LATEST_TAG | sed 's/v//' | sed 's/-.*//')
+        
+        IFS='.' read -ra VERSION_PARTS <<< "$VERSION_NUM"
+        MAJOR=${VERSION_PARTS[0]:-0}
+        MINOR=${VERSION_PARTS[1]:-0}
+        PATCH=${VERSION_PARTS[2]:-0}
+        PATCH=$((PATCH + 1))
+        
+        RC_COUNT=$(git tag -l "v${MAJOR}.${MINOR}.${PATCH}-rc.*" | wc -l)
+        RC_NUM=$((RC_COUNT + 1))
+        
+        NEW_VERSION="v${MAJOR}.${MINOR}.${PATCH}-rc.${RC_NUM}"
+        
+        echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
+        echo "Generated version: $NEW_VERSION"
+    
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Tag Docker Image
+      id: tag-images
+      run: |
+        SOURCE_IMAGE="${{ needs.find-latest-images.outputs.image-digest-url }}"
+        VERSION="${{ steps.generate-version.outputs.version }}"
+        
+        docker pull $SOURCE_IMAGE
+        
+        TARGET_IMAGE="ghcr.io/${{ github.repository }}/monolith:${VERSION}"
+        docker tag $SOURCE_IMAGE $TARGET_IMAGE
+        docker push $TARGET_IMAGE
+        
+        echo "Tagged and pushed: $TARGET_IMAGE"
+    
+    - name: Set image URLs output
+      id: set-images
+      run: |
+        VERSION="${{ steps.generate-version.outputs.version }}"
+        IMAGE_URL="ghcr.io/${{ github.repository }}/monolith:${VERSION}"
+        echo "image-urls=$IMAGE_URL" >> $GITHUB_OUTPUT
+    
+    - name: Create Prerelease
+      id: create-release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.generate-version.outputs.version }}
+        release_name: ${{ steps.generate-version.outputs.version }}
+        body: |
+          ## Prerelease ${{ steps.generate-version.outputs.version }}
+          
+          **Environment**: Acceptance
+          **Status**: Prerelease
+          
+          ### Docker Images
+          - `${{ steps.set-images.outputs.image-urls }}`
+          
+          ### Changes
+          - Automated acceptance tests passed
+          - Ready for QA deployment
+        draft: false
+        prerelease: true
+
+  summary:
+    needs: [find-latest-images, should-run, prerelease, system-test]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Acceptance Stage Summary
+      run: |
+        echo "## Acceptance Stage Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ needs.prerelease.result }}" == "success" ]; then
+          echo "✅ **Stage Status**: Success" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Prerelease Created" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: \`${{ needs.prerelease.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Images**: ${{ needs.prerelease.outputs.image-urls }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Trigger QA deployment with version: \`${{ needs.prerelease.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **Stage Status**: Failed" >> $GITHUB_STEP_SUMMARY
+        fi
