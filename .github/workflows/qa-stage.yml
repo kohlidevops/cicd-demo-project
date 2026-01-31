@@ -56,6 +56,10 @@ jobs:
           environment: qa
           version: ${{ inputs.version }}
           image-urls: ${{ needs.resolve-docker-images.outputs.image-urls }}
+          ssh-host: ${{ secrets.AWS_QA_HOST }}
+          ssh-user: ${{ secrets.AWS_QA_USER }}
+          ssh-key: ${{ secrets.AWS_QA_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   status-version:
     needs: [deployment]

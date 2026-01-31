@@ -78,8 +78,12 @@ jobs:
       with:
         environment: acceptance
         version: latest
-        image-urls: ${{ needs.find-latest-images.outputs.image-digest-urls }}
-
+        image-urls: '["${{ needs.find-latest-images.outputs.image-digest-url }}"]'
+        ssh-host: ${{ secrets.AWS_ACCEPTANCE_HOST }}
+        ssh-user: ${{ secrets.AWS_ACCEPTANCE_USER }}
+        ssh-key: ${{ secrets.AWS_ACCEPTANCE_KEY }}
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:

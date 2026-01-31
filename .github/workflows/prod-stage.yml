@@ -99,6 +99,10 @@ jobs:
           environment: production
           version: ${{ needs.generate-production-version.outputs.production-version }}
           image-urls: ${{ needs.tag-docker-images.outputs.image-urls }}
+          ssh-host: ${{ secrets.AWS_PRODUCTION_HOST }}
+          ssh-user: ${{ secrets.AWS_PRODUCTION_USER }}
+          ssh-key: ${{ secrets.AWS_PRODUCTION_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
   production-release:
     needs: [generate-production-version, tag-docker-images, deploy-docker-images]
