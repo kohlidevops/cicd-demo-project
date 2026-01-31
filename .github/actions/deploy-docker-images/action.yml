@@ -36,55 +36,23 @@ runs:
         echo "image-url=$IMAGE_URL" >> $GITHUB_OUTPUT
         echo "Deploying: $IMAGE_URL"
 
-    - name: Deploy to Server
+    - name: Create Deployment Script
       shell: bash
       run: |
-        set -e
-        
-        SSH_HOST="${{ inputs.ssh-host }}"
-        SSH_USER="${{ inputs.ssh-user }}"
-        IMAGE_URL="${{ steps.parse.outputs.image-url }}"
-        VERSION="${{ inputs.version }}"
-        ENVIRONMENT="${{ inputs.environment }}"
-        GITHUB_TOKEN="${{ inputs.github-token }}"
-        GITHUB_ACTOR="${{ github.actor }}"
-        
-        echo "🚀 Deploying to $ENVIRONMENT environment"
-        echo "📦 Host: $SSH_HOST"
-        echo "👤 User: $SSH_USER"
-        echo "🐳 Image: $IMAGE_URL"
-        echo "🏷️  Version: $VERSION"
-        
-        # Create SSH key file
-        mkdir -p ~/.ssh
-        echo "${{ inputs.ssh-key }}" > ~/.ssh/deploy_key
-        chmod 600 ~/.ssh/deploy_key
-        
-        # Add host to known_hosts
-        ssh-keyscan -H $SSH_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
-        
-        # Create deployment script with variables embedded
-        cat > /tmp/deploy.sh << EOF
+        cat > /tmp/deploy.sh << 'SCRIPT_END'
         #!/bin/bash
         set -e
         
-        # Variables passed from GitHub Actions
-        ENVIRONMENT="${ENVIRONMENT}"
-        IMAGE_URL="${IMAGE_URL}"
-        VERSION="${VERSION}"
-        GITHUB_TOKEN="${GITHUB_TOKEN}"
-        GITHUB_ACTOR="${GITHUB_ACTOR}"
-        
-        echo "🚀 Starting deployment to \${ENVIRONMENT}"
-        echo "📦 Image: \${IMAGE_URL}"
-        echo "🏷️  Version: \${VERSION}"
+        echo "🚀 Starting deployment to $ENVIRONMENT"
+        echo "📦 Image: $IMAGE_URL"
+        echo "🏷️  Version: $VERSION"
         
         # Login to GHCR
-        echo "\${GITHUB_TOKEN}" | docker login ghcr.io -u \${GITHUB_ACTOR} --password-stdin
+        echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin 2>&1 | grep -v "WARNING"
         
         # Pull new image
         echo "⬇️  Pulling image..."
-        docker pull "\${IMAGE_URL}"
+        docker pull "$IMAGE_URL"
         
         # Stop existing container
         echo "🛑 Stopping existing container..."
@@ -98,8 +66,8 @@ runs:
           --restart unless-stopped \
           -p 3000:3000 \
           -e NODE_ENV=production \
-          -e APP_VERSION=\${VERSION} \
-          "\${IMAGE_URL}"
+          -e APP_VERSION="$VERSION" \
+          "$IMAGE_URL"
         
         # Wait for application to start
         echo "⏳ Waiting for application to start..."
@@ -110,7 +78,7 @@ runs:
         MAX_ATTEMPTS=30
         ATTEMPT=0
         
-        while [ \$ATTEMPT -lt \$MAX_ATTEMPTS ]; do
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
           if curl -f http://localhost:3000/health 2>/dev/null; then
             echo "✅ Health check passed!"
             echo "✅ Deployment successful!"
@@ -123,36 +91,70 @@ runs:
             # Cleanup old images
             echo ""
             echo "🧹 Cleaning up old images..."
-            docker image prune -af --filter "until=24h" || true
+            docker image prune -af --filter "until=24h" 2>/dev/null || true
             
             echo ""
             echo "🎉 Deployment complete!"
             exit 0
           fi
           
-          ATTEMPT=\$((ATTEMPT + 1))
-          echo "⏳ Waiting for health check... attempt \$ATTEMPT/\$MAX_ATTEMPTS"
+          ATTEMPT=$((ATTEMPT + 1))
+          echo "⏳ Waiting for health check... attempt $ATTEMPT/$MAX_ATTEMPTS"
           sleep 2
         done
         
-        echo "❌ Health check failed after \$MAX_ATTEMPTS attempts"
+        echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
         echo "📋 Container logs:"
-        docker logs monolith-app
+        docker logs monolith-app || true
         exit 1
-        EOF
+        SCRIPT_END
         
-        # Make script executable
         chmod +x /tmp/deploy.sh
+
+    - name: Deploy to Server
+      shell: bash
+      env:
+        SSH_HOST: ${{ inputs.ssh-host }}
+        SSH_USER: ${{ inputs.ssh-user }}
+        SSH_KEY: ${{ inputs.ssh-key }}
+        IMAGE_URL: ${{ steps.parse.outputs.image-url }}
+        VERSION: ${{ inputs.version }}
+        ENVIRONMENT: ${{ inputs.environment }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_ACTOR: ${{ github.actor }}
+      run: |
+        set -e
+        
+        echo "🚀 Deploying to $ENVIRONMENT environment"
+        echo "📦 Host: $SSH_HOST"
+        echo "👤 User: $SSH_USER"
+        echo "🐳 Image: $IMAGE_URL"
+        echo "🏷️  Version: $VERSION"
+        
+        # Validate IMAGE_URL
+        if [ -z "$IMAGE_URL" ] || [ "$IMAGE_URL" = "null" ]; then
+          echo "❌ Error: IMAGE_URL is empty or null"
+          exit 1
+        fi
+        
+        # Create SSH key file
+        mkdir -p ~/.ssh
+        echo "$SSH_KEY" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        
+        # Add host to known_hosts
+        ssh-keyscan -H $SSH_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
         
         # Copy deployment script to server
         echo "📤 Copying deployment script to server..."
-        scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no /tmp/deploy.sh ${SSH_USER}@${SSH_HOST}:/tmp/
+        scp -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no /tmp/deploy.sh ${SSH_USER}@${SSH_HOST}:/tmp/deploy.sh
         
-        # Execute deployment script on server
+        # Execute deployment script on server with environment variables
         echo "🚀 Executing deployment on server..."
-        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_HOST} "bash /tmp/deploy.sh"
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_HOST} \
+          bash -c "export ENVIRONMENT='$ENVIRONMENT' IMAGE_URL='$IMAGE_URL' VERSION='$VERSION' GITHUB_TOKEN='$GITHUB_TOKEN' GITHUB_ACTOR='$GITHUB_ACTOR' && bash /tmp/deploy.sh"
         
         # Cleanup
         rm -f ~/.ssh/deploy_key /tmp/deploy.sh
         
-        echo "✅ Deployment to ${ENVIRONMENT} completed successfully!"
+        echo "✅ Deployment to $ENVIRONMENT completed successfully!"
