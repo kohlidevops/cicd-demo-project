@@ -11,7 +11,7 @@ app.get('/health', (req: Request, res: Response) => {
   res.status(200).json({ 
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    version: process.env.APP_VERSION || '1.0.0'
+    version: process.env.APP_VERSION || '1.1.0'
   });
 });
 
