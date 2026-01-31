@@ -46,6 +46,8 @@ runs:
         IMAGE_URL="${{ steps.parse.outputs.image-url }}"
         VERSION="${{ inputs.version }}"
         ENVIRONMENT="${{ inputs.environment }}"
+        GITHUB_TOKEN="${{ inputs.github-token }}"
+        GITHUB_ACTOR="${{ github.actor }}"
         
         echo "🚀 Deploying to $ENVIRONMENT environment"
         echo "📦 Host: $SSH_HOST"
@@ -61,21 +63,28 @@ runs:
         # Add host to known_hosts
         ssh-keyscan -H $SSH_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
         
-        # Create deployment script
-        cat > /tmp/deploy.sh << 'EOF'
+        # Create deployment script with variables embedded
+        cat > /tmp/deploy.sh << EOF
         #!/bin/bash
         set -e
         
-        echo "🚀 Starting deployment to ${ENVIRONMENT}"
-        echo "📦 Image: ${IMAGE_URL}"
-        echo "🏷️  Version: ${VERSION}"
+        # Variables passed from GitHub Actions
+        ENVIRONMENT="${ENVIRONMENT}"
+        IMAGE_URL="${IMAGE_URL}"
+        VERSION="${VERSION}"
+        GITHUB_TOKEN="${GITHUB_TOKEN}"
+        GITHUB_ACTOR="${GITHUB_ACTOR}"
+        
+        echo "🚀 Starting deployment to \${ENVIRONMENT}"
+        echo "📦 Image: \${IMAGE_URL}"
+        echo "🏷️  Version: \${VERSION}"
         
         # Login to GHCR
-        echo "${GITHUB_TOKEN}" | docker login ghcr.io -u ${GITHUB_ACTOR} --password-stdin
+        echo "\${GITHUB_TOKEN}" | docker login ghcr.io -u \${GITHUB_ACTOR} --password-stdin
         
         # Pull new image
         echo "⬇️  Pulling image..."
-        docker pull ${IMAGE_URL}
+        docker pull "\${IMAGE_URL}"
         
         # Stop existing container
         echo "🛑 Stopping existing container..."
@@ -89,8 +98,8 @@ runs:
           --restart unless-stopped \
           -p 3000:3000 \
           -e NODE_ENV=production \
-          -e APP_VERSION=${VERSION} \
-          ${IMAGE_URL}
+          -e APP_VERSION=\${VERSION} \
+          "\${IMAGE_URL}"
         
         # Wait for application to start
         echo "⏳ Waiting for application to start..."
@@ -101,7 +110,7 @@ runs:
         MAX_ATTEMPTS=30
         ATTEMPT=0
         
-        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+        while [ \$ATTEMPT -lt \$MAX_ATTEMPTS ]; do
           if curl -f http://localhost:3000/health 2>/dev/null; then
             echo "✅ Health check passed!"
             echo "✅ Deployment successful!"
@@ -121,12 +130,12 @@ runs:
             exit 0
           fi
           
-          ATTEMPT=$((ATTEMPT + 1))
-          echo "⏳ Waiting for health check... attempt $ATTEMPT/$MAX_ATTEMPTS"
+          ATTEMPT=\$((ATTEMPT + 1))
+          echo "⏳ Waiting for health check... attempt \$ATTEMPT/\$MAX_ATTEMPTS"
           sleep 2
         done
         
-        echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
+        echo "❌ Health check failed after \$MAX_ATTEMPTS attempts"
         echo "📋 Container logs:"
         docker logs monolith-app
         exit 1
@@ -141,13 +150,7 @@ runs:
         
         # Execute deployment script on server
         echo "🚀 Executing deployment on server..."
-        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_HOST} \
-          "export ENVIRONMENT='${ENVIRONMENT}' \
-           IMAGE_URL='${IMAGE_URL}' \
-           VERSION='${VERSION}' \
-           GITHUB_TOKEN='${{ inputs.github-token }}' \
-           GITHUB_ACTOR='${{ github.actor }}' && \
-           bash /tmp/deploy.sh"
+        ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${SSH_USER}@${SSH_HOST} "bash /tmp/deploy.sh"
         
         # Cleanup
         rm -f ~/.ssh/deploy_key /tmp/deploy.sh
