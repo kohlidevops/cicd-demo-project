@@ -62,75 +62,75 @@ runs:
         ssh-keyscan -H $SSH_HOST >> ~/.ssh/known_hosts 2>/dev/null || true
         
         # Create deployment script
-        cat > /tmp/deploy.sh << 'DEPLOY_SCRIPT'
-#!/bin/bash
-set -e
-
-echo "🚀 Starting deployment to ${ENVIRONMENT}"
-echo "📦 Image: ${IMAGE_URL}"
-echo "🏷️  Version: ${VERSION}"
-
-# Login to GHCR
-echo "${GITHUB_TOKEN}" | docker login ghcr.io -u ${GITHUB_ACTOR} --password-stdin
-
-# Pull new image
-echo "⬇️  Pulling image..."
-docker pull ${IMAGE_URL}
-
-# Stop existing container
-echo "🛑 Stopping existing container..."
-docker stop monolith-app 2>/dev/null || true
-docker rm monolith-app 2>/dev/null || true
-
-# Run new container
-echo "▶️  Starting new container..."
-docker run -d \
-  --name monolith-app \
-  --restart unless-stopped \
-  -p 3000:3000 \
-  -e NODE_ENV=production \
-  -e APP_VERSION=${VERSION} \
-  ${IMAGE_URL}
-
-# Wait for application to start
-echo "⏳ Waiting for application to start..."
-sleep 10
-
-# Verify deployment with health check
-echo "🏥 Running health check..."
-MAX_ATTEMPTS=30
-ATTEMPT=0
-
-while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-  if curl -f http://localhost:3000/health 2>/dev/null; then
-    echo "✅ Health check passed!"
-    echo "✅ Deployment successful!"
-    
-    # Show container status
-    echo ""
-    echo "📊 Container status:"
-    docker ps --filter name=monolith-app
-    
-    # Cleanup old images
-    echo ""
-    echo "🧹 Cleaning up old images..."
-    docker image prune -af --filter "until=24h" || true
-    
-    echo ""
-    echo "🎉 Deployment complete!"
-    exit 0
-  fi
-  
-  ATTEMPT=$((ATTEMPT + 1))
-  echo "⏳ Waiting for health check... attempt $ATTEMPT/$MAX_ATTEMPTS"
-  sleep 2
-done
-
-echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
-echo "📋 Container logs:"
-docker logs monolith-app
-exit 1
-DEPLOY_SCRIPT
+        cat > /tmp/deploy.sh << 'EOF'
+        #!/bin/bash
+        set -e
+        
+        echo "🚀 Starting deployment to ${ENVIRONMENT}"
+        echo "📦 Image: ${IMAGE_URL}"
+        echo "🏷️  Version: ${VERSION}"
+        
+        # Login to GHCR
+        echo "${GITHUB_TOKEN}" | docker login ghcr.io -u ${GITHUB_ACTOR} --password-stdin
+        
+        # Pull new image
+        echo "⬇️  Pulling image..."
+        docker pull ${IMAGE_URL}
+        
+        # Stop existing container
+        echo "🛑 Stopping existing container..."
+        docker stop monolith-app 2>/dev/null || true
+        docker rm monolith-app 2>/dev/null || true
+        
+        # Run new container
+        echo "▶️  Starting new container..."
+        docker run -d \
+          --name monolith-app \
+          --restart unless-stopped \
+          -p 3000:3000 \
+          -e NODE_ENV=production \
+          -e APP_VERSION=${VERSION} \
+          ${IMAGE_URL}
+        
+        # Wait for application to start
+        echo "⏳ Waiting for application to start..."
+        sleep 10
+        
+        # Verify deployment with health check
+        echo "🏥 Running health check..."
+        MAX_ATTEMPTS=30
+        ATTEMPT=0
+        
+        while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+          if curl -f http://localhost:3000/health 2>/dev/null; then
+            echo "✅ Health check passed!"
+            echo "✅ Deployment successful!"
+            
+            # Show container status
+            echo ""
+            echo "📊 Container status:"
+            docker ps --filter name=monolith-app
+            
+            # Cleanup old images
+            echo ""
+            echo "🧹 Cleaning up old images..."
+            docker image prune -af --filter "until=24h" || true
+            
+            echo ""
+            echo "🎉 Deployment complete!"
+            exit 0
+          fi
+          
+          ATTEMPT=$((ATTEMPT + 1))
+          echo "⏳ Waiting for health check... attempt $ATTEMPT/$MAX_ATTEMPTS"
+          sleep 2
+        done
+        
+        echo "❌ Health check failed after $MAX_ATTEMPTS attempts"
+        echo "📋 Container logs:"
+        docker logs monolith-app
+        exit 1
+        EOF
         
         # Make script executable
         chmod +x /tmp/deploy.sh
